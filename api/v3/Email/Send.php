@@ -54,16 +54,11 @@ function civicrm_api3_email_send($params) {
   if (!preg_match('/[0-9]+(,[0-9]+)*/i', $params['contact_id'])) {
     throw new API_Exception('Parameter contact_id must be a unique id or a list of ids separated by comma');
   }
-  $contactIds = explode(",", $params['contact_id']);
   $alternativeEmailAddress = !empty($params['alternative_receiver_address']) ? $params['alternative_receiver_address'] : FALSE;
 
   $case_id = FALSE;
   if (isset($params['case_id'])) {
     $case_id = $params['case_id'];
-  }
-  $contribution_id = FALSE;
-  if (isset($params['contribution_id'])) {
-    $contribution_id = $params['contribution_id'];
   }
 
   // Compatibility with CiviCRM > 4.3
@@ -84,61 +79,26 @@ function civicrm_api3_email_send($params) {
     throw new API_Exception('You have to provide both from_name and from_email');
   }
 
-  $domain     = CRM_Core_BAO_Domain::getDomain();
-  $result     = NULL;
-  $hookTokens = array();
-
   if (!$messageTemplates->find(TRUE)) {
     throw new API_Exception('Could not find template with ID: ' . $params['template_id']);
   }
 
-  $body_text    = $messageTemplates->msg_text;
-  $body_html    = $messageTemplates->msg_html;
-  $body_subject = $messageTemplates->msg_subject;
-  if (!$body_text) {
-    $body_text = CRM_Utils_String::htmlToText($body_html);
-  }
+  $tokenProc = _civicrm_api3_email_send_createTokenProcessor($params, $messageTemplates);
+  $tokenProc->evaluate();
 
   $returnValues = array();
-  foreach ($contactIds as $contactId) {
-    $contact_params = array(array('contact_id', '=', $contactId, 0, 0));
-    list($contact, $_) = CRM_Contact_BAO_Query::apiQuery($contact_params);
+  foreach ($tokenProc->getRows() as $tokenRow) {
+    /** @var \Civi\Token\TokenRow $tokenRow */
+    $contactId = $tokenRow->context['contactId'];
+    $messageSubject = $tokenRow->render('subject');
+    $html = $tokenRow->render('body_html');
+    $text = $tokenRow->render('body_text');
 
-    //CRM-4524
-    $contact = reset($contact);
+    list($contact) = CRM_Contact_BAO_Query::apiQuery([['contact_id', '=', $contactId, 0, 0]]);
+    $contact = reset($contact); // CRM-4524 - Huh?
 
     if (!$contact || is_a($contact, 'CRM_Core_Error')) {
-      throw new API_Exception('Could not find contact with ID: ' . $contact_params['contact_id']);
-    }
-
-    //CRM-5734
-
-    // get tokens to be replaced
-    $tokens = array_merge_recursive(CRM_Utils_Token::getTokens($body_text),
-        CRM_Utils_Token::getTokens($body_html),
-        CRM_Utils_Token::getTokens($body_subject));
-
-    list($details) = CRM_Utils_Token::getTokenDetails($contactIds, $returnProperties, FALSE, FALSE, NULL, $tokens);
-    // get replacement text for these tokens
-    $returnProperties = array(
-      'sort_name' => 1,
-      'email' => 1,
-      'do_not_email' => 1,
-      'is_deceased' => 1,
-      'on_hold' => 1,
-      'display_name' => 1,
-      'preferred_mail_format' => 1,
-    );
-    if (isset($tokens['contact'])) {
-      foreach ($tokens['contact'] as $key => $value) {
-        $returnProperties[$value] = 1;
-      }
-    }
-    if ($case_id) {
-      $contact['case.id'] = $case_id;
-    }
-    if ($contribution_id) {
-      $contact['contribution_id'] = $contribution_id;
+      throw new API_Exception('Could not find contact with ID: ' . $contactId);
     }
 
     if ($alternativeEmailAddress) {
@@ -163,54 +123,6 @@ function civicrm_api3_email_send($params) {
        */
       $email = $contact['email'];
       $toName = $contact['display_name'];
-    }
-
-    // do replacements in text and html body
-    $type = array('html', 'text');
-    foreach ($type as $key => $value) {
-      $bodyType = "body_{$value}";
-      if ($$bodyType) {
-        if ($contribution_id) {
-          try {
-            $contribution = civicrm_api3('Contribution', 'getsingle', array('id' => $contribution_id));
-            $$bodyType = CRM_Utils_Token::replaceContributionTokens($$bodyType, $contribution, TRUE, $tokens);
-          }
-          catch (Exception $e) {
-            echo $e->getMessage(); exit();
-          }
-        }
-
-        foreach ($tokens as $type => $tokenValue) {
-          foreach ($tokenValue as $var) {
-            $contactKey = NULL;
-            if ($type === 'contact') {
-              $contactKey = "$var";
-            }
-            else {
-              $contactKey = "$type.$var";
-            }
-            CRM_Utils_Token::token_replace($type, $var, $contact[$contactKey], $$bodyType);
-          }
-        }
-      }
-    }
-    $html = $body_html;
-    $text = $body_text;
-    if (defined('CIVICRM_MAIL_SMARTY') && CIVICRM_MAIL_SMARTY) {
-      $smarty = CRM_Core_Smarty::singleton();
-      foreach ($type as $elem) {
-        $$elem = $smarty->fetch("string:{$$elem}");
-      }
-    }
-
-    // do replacements in message subject
-    $messageSubject = CRM_Utils_Token::replaceContactTokens($body_subject, $contact, FALSE, $tokens);
-    $messageSubject = CRM_Utils_Token::replaceDomainTokens($messageSubject, $domain, TRUE, $tokens);
-    $messageSubject = CRM_Utils_Token::replaceComponentTokens($messageSubject, $contact, $tokens, TRUE);
-    $messageSubject = CRM_Utils_Token::replaceHookTokens($messageSubject, $contact, $categories, TRUE);
-
-    if (defined('CIVICRM_MAIL_SMARTY') && CIVICRM_MAIL_SMARTY) {
-      $messageSubject = $smarty->fetch("string:{$messageSubject}");
     }
 
     // set up the parameters for CRM_Utils_Mail::send
@@ -301,4 +213,84 @@ function civicrm_api3_email_send($params) {
 
   return civicrm_api3_create_success($returnValues, $params, 'Email', 'Send');
   //throw new API_Exception(/*errorMessage*/ 'Everyone knows that the magicword is "sesame"', /*errorCode*/ 1234);
+}
+
+/**
+ * Create an instance of the TokenProcessor. Populate it with
+ * - Message templates (from $messageTemplate).
+ * - Basic contextual data about each planned message (eg contact ID from $params).
+ *
+ * @param array $params
+ * @param CRM_Core_DAO_MessageTemplate $messageTemplate
+ * @return \Civi\Token\TokenProcessor
+ */
+function _civicrm_api3_email_send_createTokenProcessor($params, $messageTemplate) {
+  // TODO: In discussion between aydun+totten, we wanted add a general item called 'fields'
+  //   so that we could foreshadow data available in each row. I'm not sure
+  //   this has been finished/merged yet. But this code assumes it's working.
+  // TODO: CRM_Activity_Tokens should consume activity_id
+  // TODO: CRM_Case_Tokens should consume case_id
+  // TODO: CRM_Contribute_Tokens should consume contribution_id; like old call to replaceContributionTokens
+  // TODO: Email.send previously called replaceComponentTokens(). Determine if that's something we care about.
+
+  // The field names in $params and in the token context don't exactly match;
+  // so we'll map them.
+  $activeEntityFields = _civicrm_api3_email_send_findActiveEntityFields($params, array(
+    // string $api_param_name => string $tokenContextName
+    'activity_id' => 'activityId',
+    'case_id' => 'caseId',
+    'contribution_id' => 'contributionId',
+  ));
+
+  // Prepare the processor and general context.
+  $tokenProc = new \Civi\Token\TokenProcessor(\Civi::dispatcher(), [
+    // Unique(ish) identifier for our controller/use-case.
+    'controller' => 'civicrm_api3_email_send',
+
+    // Provide hints about what data will be available for each row.
+    // Ex: 'fields' => ['contactId', 'activityId', 'caseId'],
+    'fields' => array_values($activeEntityFields),
+
+    // Whether to enable Smarty evaluation.
+    'smarty' => (defined('CIVICRM_MAIL_SMARTY') && CIVICRM_MAIL_SMARTY),
+  ]);
+
+  // Define message templates.
+  $tokenProc->addMessage('subject', $messageTemplate->msg_subject, 'text/plain');
+  $tokenProc->addMessage('body_html', $messageTemplate->msg_html, 'text/html');
+  $tokenProc->addMessage('body_text',
+    $messageTemplate->msg_text ? $messageTemplate->msg_text : CRM_Utils_String::htmlToText($messageTemplate->msg_html),
+    'text/plain');
+
+  // Define row data.
+  foreach (explode(',', $params['contact_id']) as $contactId) {
+    $context = ['contactId' => $contactId];
+    foreach ($activeEntityFields as $paramName => $contextName) {
+      $context[$contextName] = $params[$paramName];
+    }
+    $tokenProc->addRow()->context($context);
+  }
+
+  return $tokenProc;
+}
+
+/**
+ * @param array $params
+ *   API input.
+ *   Ex: ['contact_id' => 123, 'contribution_id' => 12345]
+ * @param array $availableEntityFields
+ *   List of fields that we would be interesting to us.
+ *   Array(string $apiParamName => string $tokenContextName).
+ *   Ex: ['contribution_id' => 'contributionId']
+ * @return array
+ *   Ex: ['contribution_id' => 'contributionId']
+ */
+function _civicrm_api3_email_send_findActiveEntityFields($params, $availableEntityFields) {
+  $activeEntityFields = [];
+  foreach ($availableEntityFields as $paramName => $contextName) {
+    if (isset($params[$paramName])) {
+      $activeEntityFields[$paramName] = $contextName;
+    }
+  }
+  return $activeEntityFields;
 }

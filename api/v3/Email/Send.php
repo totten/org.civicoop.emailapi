@@ -225,7 +225,7 @@ function civicrm_api3_email_send($params) {
  * @return \Civi\Token\TokenProcessor
  */
 function _civicrm_api3_email_send_createTokenProcessor($params, $messageTemplate) {
-  // TODO: In discussion between aydun+totten, we wanted add a general item called 'fields'
+  // TODO: In discussion between aydun+totten, we wanted add a general item called 'schema'
   //   so that we could foreshadow data available in each row. I'm not sure
   //   this has been finished/merged yet. But this code assumes it's working.
   // TODO: CRM_Activity_Tokens should consume activity_id
@@ -248,8 +248,8 @@ function _civicrm_api3_email_send_createTokenProcessor($params, $messageTemplate
     'controller' => 'civicrm_api3_email_send',
 
     // Provide hints about what data will be available for each row.
-    // Ex: 'fields' => ['contactId', 'activityId', 'caseId'],
-    'fields' => array_values($activeEntityFields),
+    // Ex: 'schema' => ['contactId', 'activityId', 'caseId'],
+    'schema' => array_values($activeEntityFields),
 
     // Whether to enable Smarty evaluation.
     'smarty' => (defined('CIVICRM_MAIL_SMARTY') && CIVICRM_MAIL_SMARTY),
